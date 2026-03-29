@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { Client } = require('pg');
 const fs = require('fs');
+const path = require('path');
 
 const CONFIG = {
     db: {
@@ -18,125 +19,148 @@ const CONFIG = {
     },
 
     sys: {
-        tokenPath: process.env.TOKEN_PATH || './resume_token.txt',
+        tokenPath: `./tokens/resume_token_${process.env.TARGET_APP.replace(/\./g, '_')}.txt`,
         throttleLimit: 1
     }
 };
+
+const TABLE_NAME = `reviews_${CONFIG.target.appId.replace(/\./g, '_')}`;
+async function setupDatabase(dbClient) {
+    const createTableSQL = `
+        CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
+            review_id VARCHAR(255) PRIMARY KEY, 
+            country VARCHAR(10) NOT NULL,
+            lang VARCHAR(10) NOT NULL,
+            user_name VARCHAR(255),
+            user_image TEXT,
+            score INTEGER CHECK (score >= 1 AND score <= 5),
+            review_text TEXT,
+            thumbs_up INTEGER DEFAULT 0,
+            app_version VARCHAR(100),
+            review_at TIMESTAMP WITH TIME ZONE NOT NULL, 
+            reply_text TEXT,
+            reply_at TIMESTAMP WITH TIME ZONE,
+            fetched_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_${TABLE_NAME}_date ON ${TABLE_NAME}(review_at);
+        CREATE INDEX IF NOT EXISTS idx_${TABLE_NAME}_score ON ${TABLE_NAME}(score);
+    `;
+    await dbClient.query(createTableSQL);
+    console.log(`Table Checked/Created: ${TABLE_NAME}`);
+}
+
 
 async function runAdvancedScraper() {
     const gplay = (await import('google-play-scraper')).default;
 
     const dbClient = new Client(CONFIG.db);
 
-    await dbClient.connect();
-    console.log("Connect Success\nStarting scraping ${CONFIG.target.appId} review...\n");
+    try{
+        await dbClient.connect();
+        await setupDatabase(dbClient);
+        console.log(`Connect Success\nStarting scraping ${CONFIG.target.appId} review into [${TABLE_NAME}]\n`);
+        const insertSQL = `
+            INSERT INTO ${TABLE_NAME} (
+                review_id, country, lang, 
+                user_name, user_image, score, review_text, 
+                thumbs_up, app_version, review_at, 
+                reply_text, reply_at
+            ) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (review_id) DO NOTHING
+            RETURNING review_id;
+        `;
+        let nextToken = null;      
+        let pageCount = 0;         
+        let totalNewCount = 0;     
+        let stopScraping = false;  
 
-    const insertSQL = `
-        INSERT INTO play_store_reviews (
-            review_id, app_id, country, lang, 
-            user_name, user_image, score, review_text, 
-            thumbs_up, app_version, review_at, 
-            reply_text, reply_at
-        ) 
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        ON CONFLICT (review_id) DO NOTHING
-        RETURNING review_id;
-    `;
+        if (!fs.existsSync('./tokens')) fs.mkdirSync('./tokens');
 
-    let nextToken = null;      
-    let pageCount = 0;         
-    let totalNewCount = 0;     
-    let stopScraping = false;  
+        if (fs.existsSync(CONFIG.sys.tokenPath)) {
+            nextToken = fs.readFileSync(CONFIG.sys.tokenPath, 'utf8');
+            console.log(`Resume from token found at ${CONFIG.sys.tokenPath}`);
+        }
 
-    let isResuming = false;
-    if (fs.existsSync(CONFIG.sys.tokenPath)) {
-        nextToken = fs.readFileSync(CONFIG.sys.tokenPath, 'utf8');
-        isResuming = true;
-        console.log(`\nResume Downloading...\n`);
-    } else {
-        console.log(`\nNormal Scraping...\n`);
-    }
+        while (!stopScraping) {
+            pageCount++;
+            console.log(`Fetching page ${pageCount}...`);
+            try {
+                const response = await gplay.reviews({
+                    appId: CONFIG.target.appId,
+                    sort: gplay.sort.NEWEST, //2 
+                    paginate: true,
+                    nextPaginationToken: nextToken,
+                    lang: CONFIG.target.lang,
+                    country: CONFIG.target.country,
+                    throttle: CONFIG.sys.throttleLimit
+                });
 
-    while (!stopScraping) {
-        pageCount++;
-        console.log(`Asking ${pageCount} page reviews data`);
+                const dataList = response.data;
+                nextToken = response.nextPaginationToken;
 
-        try {
-            const response = await gplay.reviews({
-                appId: CONFIG.target.appId,
-                sort: gplay.sort.NEWEST, //2 
-                paginate: true,
-                nextPaginationToken: nextToken,
-                lang: CONFIG.target.lang,
-                country: CONFIG.target.country,
-                throttle: CONFIG.sys.throttleLimit
-            });
+                if (nextToken) {
+                    fs.writeFileSync(CONFIG.sys.tokenPath, nextToken);
+                }
 
-            const dataList = response.data;
-            nextToken = response.nextPaginationToken;
+                if (!dataList || dataList.length === 0) {
+                    console.log("No more reviews found.");
+                    break; 
+                }
 
-            if (nextToken) {
-                fs.writeFileSync(CONFIG.sys.tokenPath, nextToken);
-            }
+                let pageNewCount = 0;
 
-            if (!dataList || dataList.length === 0) {
-                console.log("No more review. Ending...");
-                break; 
-            }
+                for (let review of dataList) {
+                    const values = [
+                        review.id, CONFIG.target.country, CONFIG.target.lang,
+                        review.userName, review.userImage, review.score, review.text,
+                        review.thumbsUp, review.version || 'unknown',
+                        new Date(review.date),
+                        review.replyText || null,
+                        review.replyDate ? new Date(review.replyDate) : null
+                    ];
 
-            let pageNewCount = 0;
+                    const result = await dbClient.query(insertSQL, values);
 
-            for (let review of dataList) {
-                const values = [
-                    review.id, CONFIG.target.appId, CONFIG.target.country, CONFIG.target.lang,
-                    review.userName, review.userImage, review.score, review.text,
-                    review.thumbsUp, review.version || 'unknown',
-                    new Date(review.date),
-                    review.replyText || null,
-                    review.replyDate ? new Date(review.replyDate) : null
-                ];
-
-                const result = await dbClient.query(insertSQL, values);
-
-                if (result.rowCount > 0) {
-                    pageNewCount++;
-                    totalNewCount++;
-                } else {
-                    // console.log(`Getting elder review (ID: ${review.id}), ending...`);
-                    // stopScraping = true;
-                    // break;
-                    if (!isResuming) {
-                        console.log(`Getting elder review (ID: ${review.id}), ending...`);
-                        stopScraping = true;
-                        break; 
+                    if (result.rowCount > 0) {
+                        pageNewCount++;
+                        totalNewCount++;
+                    } else {
+                        if (!fs.existsSync(CONFIG.sys.tokenPath)) {
+                            console.log(`Reached existing review (ID: ${review.id}), ending...`);
+                            stopScraping = true;
+                            break; 
+                        }
                     }
                 }
-            }
 
-            console.log(` ${pageCount} page done, new reviews: ${pageNewCount}.`);
+                console.log(` ${pageCount} page done, new reviews: ${pageNewCount}.`);
 
-            if (stopScraping) {
+                if (stopScraping || !nextToken) {
+                    if(!nextToken && fs.existsSync(CONFIG.sys.tokenPath)){
+                        fs.unlinkSync(CONFIG.sys.tokenPath);
+                    }
+                    break; 
+                }
+
+
+            } catch (error) {
+                console.error(`Error, ${pageCount} page`, error.message);
                 break; 
             }
-
-            if (!nextToken) {
-                console.log("No more token...");
-                if (fs.existsSync(path)) {
-                    fs.unlinkSync(path); 
-                }
-                break;
-            }
-
-
-        } catch (error) {
-            console.error(`Error, ${pageCount} page`, error.message);
-            break; 
-        }
     }
-
     console.log(`\nSuccess. Adding ${totalNewCount}  new reviews`);
-    await dbClient.end();
-    console.log("Database closed");
+    
+
+
+
+
+    } catch (error) {
+        console.error(`Fatal Error:`, error.message);
+    } finally {
+        await dbClient.end();
+        console.log("Database closed.");
+    }
 }
 
 runAdvancedScraper();
